@@ -1,0 +1,93 @@
+// CombinedSDF计算着色器
+// 用于加速SDF的预计算过程
+
+#pragma kernel CombineSDF
+
+// 输入/输出缓冲区
+RWStructuredBuffer<float> ResultGrid; // 结果SDF网格
+StructuredBuffer<float3> SDFGrids;    // 所有SDF组件的数据
+
+// 参数
+float3 GridSize;       // 网格分辨率
+int SDFCount;          // SDF组件数量
+float3 BoundsMin;      // 边界最小点
+float CellSize;        // 单元格大小
+
+// 定义组合操作类型
+#define UNION 0
+#define INTERSECTION 1
+#define SUBTRACTION 2
+#define SMOOTH_UNION 3
+
+// 数据结构，与CombinedSDF.cs中的SDFData结构对应
+struct SDFData {
+    float distance;    // SDF距离值
+    int operation;     // 组合操作类型
+    float smoothFactor; // 平滑因子
+};
+
+// 获取网格索引
+int GetGridIndex(int3 pos) {
+    return pos.x + int(GridSize.x) * (pos.y + int(GridSize.y) * pos.z);
+}
+
+// 获取SDF数据
+SDFData GetSDFData(int sdfIndex, int gridIndex) {
+    int dataIndex = sdfIndex * int(GridSize.x * GridSize.y * GridSize.z) + gridIndex;
+    
+    SDFData data;
+    data.distance = asfloat(SDFGrids[dataIndex * 3]);
+    data.operation = asint(SDFGrids[dataIndex * 3 + 1]);
+    data.smoothFactor = asfloat(SDFGrids[dataIndex * 3 + 2]);
+    
+    return data;
+}
+
+// 平滑最小值函数（用于平滑并集）
+float SmoothMin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return lerp(b, a, h) - k * h * (1.0 - h);
+}
+
+[numthreads(8, 8, 8)]
+void CombineSDF(uint3 id : SV_DispatchThreadID) {
+    // 检查边界
+    if (id.x >= uint(GridSize.x) || id.y >= uint(GridSize.y) || id.z >= uint(GridSize.z))
+        return;
+    
+    int gridIndex = GetGridIndex(id);
+    
+    // 获取第一个SDF组件的距离值作为初始结果
+    SDFData firstSDF = GetSDFData(0, gridIndex);
+    float result = firstSDF.distance;
+    
+    // 组合所有其他SDF组件
+    for (int i = 1; i < SDFCount; i++) {
+        SDFData currentSDF = GetSDFData(i, gridIndex);
+        float distance = currentSDF.distance;
+        int operation = currentSDF.operation;
+        float smoothFactor = currentSDF.smoothFactor;
+        
+        // 根据操作类型组合SDF
+        switch (operation) {
+            case UNION:
+                result = min(result, distance);
+                break;
+                
+            case INTERSECTION:
+                result = max(result, distance);
+                break;
+                
+            case SUBTRACTION:
+                result = max(result, -distance);
+                break;
+                
+            case SMOOTH_UNION:
+                result = SmoothMin(result, distance, smoothFactor);
+                break;
+        }
+    }
+    
+    // 存储结果
+    ResultGrid[gridIndex] = result;
+}
