@@ -1,0 +1,314 @@
+#pragma kernel ApplyForces
+#pragma kernel ApplyBoundaryConditions
+#pragma kernel SolvePressure
+#pragma kernel UpdateVelocity
+#pragma kernel AdvectVelocity
+#pragma kernel AdvectDensity
+
+// 流体网格数据
+RWStructuredBuffer<float3> VelocityBuffer;
+RWStructuredBuffer<float> PressureBuffer;
+RWStructuredBuffer<float> DensityBuffer;
+RWStructuredBuffer<int> CellTypeBuffer;
+
+// 参数
+float3 GridResolution;
+float CellSize;
+float TimeStep;
+float Viscosity;
+float Density;
+int SolverIterations;
+float3 Gravity;
+
+// 边界SDF数据
+StructuredBuffer<float4> BoundarySDFs; // xyz = 位置, w = 半径
+int BoundaryCount;
+
+// 辅助函数
+int GetIndex(int3 cell)
+{
+    return cell.x + GridResolution.x * (cell.y + GridResolution.y * cell.z);
+}
+
+bool IsInBounds(int3 cell)
+{
+    return cell.x >= 0 && cell.x < GridResolution.x &&
+           cell.y >= 0 && cell.y < GridResolution.y &&
+           cell.z >= 0 && cell.z < GridResolution.z;
+}
+
+bool IsCellFluid(int3 cell)
+{
+    if (!IsInBounds(cell))
+        return false;
+    return CellTypeBuffer[GetIndex(cell)] == 1; // 1 = Fluid
+}
+
+float3 GetCellPosition(int3 cell)
+{
+    return float3(
+        (cell.x + 0.5) * CellSize,
+        (cell.y + 0.5) * CellSize,
+        (cell.z + 0.5) * CellSize
+    );
+}
+
+// 应用外力
+[numthreads(8,8,8)]
+void ApplyForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    int index = GetIndex(id);
+    
+    // 只对流体单元应用力
+    if (CellTypeBuffer[index] == 1) // 1 = Fluid
+    {
+        VelocityBuffer[index] += Gravity * TimeStep;
+    }
+}
+
+// 应用边界条件
+[numthreads(8,8,8)]
+void ApplyBoundaryConditions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    int index = GetIndex(id);
+    float3 cellPos = GetCellPosition(id);
+    
+    // 检查每个SDF边界
+    for (int i = 0; i < BoundaryCount; i++)
+    {
+        float4 boundaryData = BoundarySDFs[i];
+        float3 boundaryPos = boundaryData.xyz;
+        float boundaryRadius = boundaryData.w;
+        
+        // 简单球形SDF
+        float distance = length(cellPos - boundaryPos) - boundaryRadius;
+        
+        // 如果单元格在SDF内部或接近表面
+        if (distance < CellSize)
+        {
+            // 计算法线
+            float3 normal = normalize(cellPos - boundaryPos);
+            
+            // 调整速度（反射或摩擦）
+            float3 velocity = VelocityBuffer[index];
+            float vDotN = dot(velocity, normal);
+            
+            if (vDotN < 0)
+            {
+                // 反射速度
+                float3 reflectedVel = velocity - 2.0 * vDotN * normal;
+                
+                // 应用摩擦力
+                reflectedVel *= 0.8; // 摩擦系数
+                
+                VelocityBuffer[index] = reflectedVel;
+            }
+            
+            // 标记为边界单元
+            CellTypeBuffer[index] = 2; // 2 = Boundary
+        }
+    }
+}
+
+// 求解压力
+[numthreads(8,8,8)]
+void SolvePressure(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    if (!IsCellFluid(id))
+        return;
+        
+    int index = GetIndex(id);
+    
+    // 计算散度
+    float divergence = 0.0;
+    float pressureSum = 0.0;
+    int validNeighbors = 0;
+    
+    // 检查六个相邻单元
+    int3 offsets[6] = {
+        int3(1,0,0), int3(-1,0,0),
+        int3(0,1,0), int3(0,-1,0),
+        int3(0,0,1), int3(0,0,-1)
+    };
+    
+    for (int i = 0; i < 6; i++)
+    {
+        int3 neighbor = id + offsets[i];
+        if (IsCellFluid(neighbor))
+        {
+            int nIndex = GetIndex(neighbor);
+            divergence += dot(VelocityBuffer[nIndex], offsets[i]);
+            pressureSum += PressureBuffer[nIndex];
+            validNeighbors++;
+        }
+    }
+    
+    // 更新压力
+    if (validNeighbors > 0)
+    {
+        float scale = TimeStep / (Density * CellSize * CellSize);
+        PressureBuffer[index] = (pressureSum - divergence * scale) / validNeighbors;
+    }
+}
+
+// 更新速度场
+[numthreads(8,8,8)]
+void UpdateVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    if (!IsCellFluid(id))
+        return;
+        
+    int index = GetIndex(id);
+    float3 velocity = VelocityBuffer[index];
+    
+    // 计算压力梯度
+    float3 pressureGradient = 0;
+    int3 offsets[6] = {
+        int3(1,0,0), int3(-1,0,0),
+        int3(0,1,0), int3(0,-1,0),
+        int3(0,0,1), int3(0,0,-1)
+    };
+    
+    for (int i = 0; i < 6; i += 2)
+    {
+        int3 pos = id + offsets[i];
+        int3 neg = id + offsets[i+1];
+        
+        float pPos = IsInBounds(pos) ? PressureBuffer[GetIndex(pos)] : PressureBuffer[index];
+        float pNeg = IsInBounds(neg) ? PressureBuffer[GetIndex(neg)] : PressureBuffer[index];
+        
+        pressureGradient += (pPos - pNeg) * offsets[i];
+    }
+    
+    // 更新速度
+    float scale = TimeStep / (Density * CellSize);
+    velocity -= pressureGradient * scale * 0.5;
+    
+    // 应用粘性
+    if (Viscosity > 0)
+    {
+        float3 viscousForce = 0;
+        int validNeighbors = 0;
+        
+        for (i = 0; i < 6; i++)
+        {
+            int3 neighbor = id + offsets[i];
+            if (IsCellFluid(neighbor))
+            {
+                viscousForce += VelocityBuffer[GetIndex(neighbor)] - velocity;
+                validNeighbors++;
+            }
+        }
+        
+        if (validNeighbors > 0)
+        {
+            velocity += viscousForce * (Viscosity * TimeStep / (CellSize * CellSize));
+        }
+    }
+    
+    VelocityBuffer[index] = velocity;
+}
+
+// 平流速度场
+[numthreads(8,8,8)]
+void AdvectVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    if (!IsCellFluid(id))
+        return;
+        
+    int index = GetIndex(id);
+    float3 pos = GetCellPosition(id);
+    float3 vel = VelocityBuffer[index];
+    
+    // 回溯粒子位置
+    float3 backPos = pos - vel * TimeStep;
+    
+    // 计算网格坐标
+    float3 gridPos = backPos / CellSize - 0.5;
+    int3 cell0 = int3(floor(gridPos));
+    
+    // 计算插值权重
+    float3 t = gridPos - cell0;
+    
+    // 三线性插值采样速度
+    float3 sampledVel = 0;
+    
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int3 offset = int3(i&1, (i>>1)&1, (i>>2)&1);
+        int3 cell = cell0 + offset;
+        
+        if (IsInBounds(cell))
+        {
+            float w = (offset.x ? t.x : (1-t.x)) *
+                     (offset.y ? t.y : (1-t.y)) *
+                     (offset.z ? t.z : (1-t.z));
+                     
+            sampledVel += w * VelocityBuffer[GetIndex(cell)];
+        }
+    }
+    
+    VelocityBuffer[index] = sampledVel;
+}
+
+// 平流密度场
+[numthreads(8,8,8)]
+void AdvectDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= GridResolution.x || id.y >= GridResolution.y || id.z >= GridResolution.z)
+        return;
+        
+    if (!IsCellFluid(id))
+        return;
+        
+    int index = GetIndex(id);
+    float3 pos = GetCellPosition(id);
+    float3 vel = VelocityBuffer[index];
+    
+    // 回溯粒子位置
+    float3 backPos = pos - vel * TimeStep;
+    
+    // 计算网格坐标
+    float3 gridPos = backPos / CellSize - 0.5;
+    int3 cell0 = int3(floor(gridPos));
+    
+    // 计算插值权重
+    float3 t = gridPos - cell0;
+    
+    // 三线性插值采样密度
+    float sampledDensity = 0;
+    
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int3 offset = int3(i&1, (i>>1)&1, (i>>2)&1);
+        int3 cell = cell0 + offset;
+        
+        if (IsInBounds(cell))
+        {
+            float w = (offset.x ? t.x : (1-t.x)) *
+                     (offset.y ? t.y : (1-t.y)) *
+                     (offset.z ? t.z : (1-t.z));
+                     
+            sampledDensity += w * DensityBuffer[GetIndex(cell)];
+        }
+    }
+    
+    DensityBuffer[index] = sampledDensity;
+}
